@@ -149,6 +149,14 @@ void MovingTarget::setSpeed(int speed)
 	calculateSpeed();
 }
 
+/// Calculates delta longitude and latitude to get to a meet point.
+void MovingTarget::calcdLonLat(double & dLon, double & dLat)
+{
+	dLon = sin(_meetPointLon - _lon) * cos(_meetPointLat);
+	dLat = cos(_lat) * sin(_meetPointLat) - sin(_lat) * cos(_meetPointLat) * 
+		cos(_meetPointLon - _lon);
+}
+
 /**
  * Calculates the speed vector based on the
  * great circle distance to destination and
@@ -160,8 +168,7 @@ void MovingTarget::calculateSpeed()
 	if (_dest != 0)
 	{
 		double dLon, dLat, length;
-		dLon = sin(_meetPointLon - _lon) * cos(_meetPointLat);
-		dLat = cos(_lat) * sin(_meetPointLat) - sin(_lat) * cos(_meetPointLat) * cos(_meetPointLon - _lon);
+		calcdLonLat(dLon, dLat);
 		length = sqrt(dLon * dLon + dLat * dLat);
 		_speedLat = dLat / length * _speedRadian;
 		_speedLon = dLon / length * _speedRadian / cos(_lat + _speedLat);
@@ -214,6 +221,76 @@ void MovingTarget::move()
 	}
 }
 
+void MovingTarget::cross(double x1, double y1, double z1, double x2, 
+	double y2, double z2, double & xout, double & yout, double & zout) {
+
+	xout = y1 * z2 - z1 * y2;
+	yout = z1 * x2 - x1 * z2;
+	zout = x1 * y2 - y1 * x2;
+}
+
+void MovingTarget::getGreatCirclePoint(double t, double uX, double uY, 
+	double uZ, double wX, double wY, double wZ, double & trX, 
+	double & trY, double & trZ) {
+
+	trX = uX * cos(t) + wX * sin(t);
+	trY = uY * cos(t) + wY * sin(t);
+	trZ = uZ * cos(t) + wZ * sin(t);
+}
+
+double MovingTarget::evaluateInterceptProximity(double t, double ourX, 
+	double ourY, double ourZ, double uX, double uY, double uZ, double wX, 
+	double wY, double wZ, double ufoSpeedRadian, double ourSpeedRadian) 
+{
+	double trX, trY, trZ;
+	getGreatCirclePoint(t, uX, uY, uZ, wX, wY, wZ, trX, trY, trZ);
+
+	double dist = acosl(ourX*trX + ourY*trY + ourZ*trZ);
+	double reachable = t * ourSpeedRadian/ufoSpeedRadian;
+	return fabs(dist - reachable);
+}
+
+/// Find an intercept point betweeen tMin and tMax assuming there's only one
+/// closest point in between them. Uses golden section search.
+std::pair<double, double> MovingTarget::findMinimum(double tMin, double tMax, 
+	double ourX, double ourY, double ourZ, double uX, double uY, double uZ, 
+	double wX, double wY, double wZ, double ufoSpeedRadian, 
+	double ourSpeedRadian)
+{
+	double gr = (sqrt(5) + 1)/2.0, tolerance = 1e-7;
+
+	double c = tMin, d = tMax, a = tMin, b = tMax;
+	double f_c = INFINITY, f_d = INFINITY;
+
+	while (fabs(c-d) > tolerance)
+	{
+		c = b - (b-a)/gr;
+		d = a + (b-a) / gr;
+
+		if (std::isinf(f_c))
+			f_c = evaluateInterceptProximity(c, ourX, ourY, ourZ, uX, uY, uZ,
+				wX, wY, wZ, ufoSpeedRadian, ourSpeedRadian);
+		if (std::isinf(f_d))
+			f_d = evaluateInterceptProximity(d, ourX, ourY, ourZ, uX, uY, uZ,
+				wX, wY, wZ, ufoSpeedRadian, ourSpeedRadian);
+
+		if (f_c < f_d)
+		{
+			b = d;
+			f_d = f_c;
+			f_c = INFINITY;
+		}
+		else
+		{
+			a = c;
+			f_c = f_d;
+			f_d = INFINITY;
+		}
+	}
+	// Return minimum point and its approximate value.
+	return std::pair<double, double>((b+a)/2.0, std::min(f_c, f_d));
+}
+
 /**
  * Calculate meeting point with the target.
  */
@@ -236,44 +313,134 @@ void MovingTarget::calculateMeetPoint()
 	MovingTarget *u = dynamic_cast<MovingTarget*>(_dest);
 	if (!u || !u->getDestination()) return;
 
-	// Speed ratio
+	// Get the speed ratio, and abort if the UFO is stationary.
 	if (AreSame(u->getSpeedRadian(), 0.0)) return;
-	const double speedRatio = _speedRadian/ u->getSpeedRadian();
 
-	// The direction pseudovector
-	double	nx = cos(u->getLatitude())*sin(u->getLongitude())*sin(u->getDestination()->getLatitude()) -
-					sin(u->getLatitude())*cos(u->getDestination()->getLatitude())*sin(u->getDestination()->getLongitude()),
-			ny = sin(u->getLatitude())*cos(u->getDestination()->getLatitude())*cos(u->getDestination()->getLongitude()) -
-					cos(u->getLatitude())*cos(u->getLongitude())*sin(u->getDestination()->getLatitude()),
-			nz = cos(u->getLatitude())*cos(u->getDestination()->getLatitude())*sin(u->getDestination()->getLongitude() - u->getLongitude());
-	// Normalize and multiplex with radian speed
-	double	nk = _speedRadian/sqrt(nx*nx+ny*ny+nz*nz);
-	nx *= nk;
-	ny *= nk;
-	nz *= nk;
+	double uLon = u->getLongitude(), uLat = u->getLatitude(),
+		   destLon = u->getDestination()->getLongitude(), 
+		   destLat = u->getDestination()->getLatitude();
 
-	// Initialize
-	double path=0, distance;
+	// Cartesian coordinates for the UFO and its destination
+	double uX = cos(uLon) * cos(uLat);
+	double uY = sin(uLon) * cos(uLat), uZ = sin(uLat);
+	double destX = cos(destLon) * cos(destLat);
+	double destY = sin(destLon) * cos(destLat), destZ = sin(destLat);
 
-	// Finding the meeting point. Don't search further than halfway across the
-	// globe (distance from interceptor's current point >= 1), as that may 
-	// cause the interceptor to go the wrong way later.
-	for (path = 0; 
-		path < M_PI && distance - path*speedRatio > 0 && path*speedRatio < 1;
-		path += _speedRadian)
-	{
-		_meetPointLat += nx*sin(_meetPointLon) - ny*cos(_meetPointLon);
-		if (std::abs(_meetPointLat) < M_PI_2) _meetPointLon += nz - (nx*cos(_meetPointLon) + ny*sin(_meetPointLon))*tan(_meetPointLat); else _meetPointLon += M_PI;
+	// Find an intercept point where the distance between the interceptor (us)
+	// and the UFO is minimal. It may still be positive if it's a very fast 
+	// UFO and we're hoping for it to change course. We'll find two such 
+	// minimal points: one that potentially involves crossing half the globe,
+	// and one that doesn't.
 
-		distance = acos(cos(_lat) * cos(_meetPointLat) * cos(_meetPointLon - _lon) + sin(_lat) * sin(_meetPointLat));
+	// First get a normal vector to u in the plane of the great circle.
+	double uvX, uvY, uvZ, wX, wY, wZ, trX, trY, trZ;
+	
+	// w = (u x v) x u, then w is the normal vector
+	cross(uX, uY, uZ, destX, destY, destZ, uvX, uvY, uvZ);
+	cross(uvX, uvY, uvZ, uX, uY, uZ, wX, wY, wZ);
+
+	double r = sqrt(wX*wX+wY*wY+wZ*wZ);
+	wX /= r;
+	wY /= r;
+	wZ /= r;
+
+	// Now the parametric for the great circle is R(t) = u cos t + w sin t
+	// where t is on 0..2*pi. https://math.stackexchange.com/questions/383711/
+
+	double ourX = cosl(_lat) * cosl(_lon);
+	double ourY = cosl(_lat) * sinl(_lon);
+	double ourZ = sinl(_lat);
+
+	// this is the value of t for which we can reach half the world and
+	// beyond wich we are at risk of going the wrong way around.
+	double halfwayPoint = std::min(_speedRadian/u->getSpeedRadian(), 2*M_PI);
+	double fullPoint = std::min(2*halfwayPoint, 2*M_PI);
+
+	// Find the angle t where we're as close as possible to the UFO.
+	std::pair<double, double> tNear = findMinimum(0, halfwayPoint, ourX, ourY, 
+		ourZ, uX, uY, uZ, wX, wY, wZ, u->getSpeedRadian(), _speedRadian);
+
+	std::pair<double, double> tFar = findMinimum(halfwayPoint, fullPoint, ourX, 
+		ourY, ourZ, uX, uY,	uZ, wX, wY, wZ, u->getSpeedRadian(), _speedRadian);
+
+	// Check whether near or far eventually gets us closest to the intercept 
+	// point. If it's near, we're done; just return that point. If it's far,
+	// we need to determine which way around the globe is the right one.
+
+	if (tNear.second <= tFar.second) {
+		getGreatCirclePoint(tNear.first, uX, uY, uZ, wX, wY, wZ, 
+			trX, trY, trZ);
+		_meetPointLon =  atan2(trY, trX); 
+		_meetPointLat = asin(trZ);
+		return;
 	}
 
-	// Correction overflowing angles
-	double lonSign = Sign(_meetPointLon);
-	double latSign = Sign(_meetPointLat);
-	while (std::abs(_meetPointLon) > M_PI) _meetPointLon -= lonSign * 2 * M_PI;
-	while (std::abs(_meetPointLat) > M_PI) _meetPointLat -= latSign * 2 * M_PI;
-	if (std::abs(_meetPointLat) > M_PI_2) { _meetPointLat = latSign * std::abs(2 * M_PI - std::abs(_meetPointLat)); _meetPointLon -= lonSign * M_PI; }
+	// For Far, determine the bearing to the UFO after it has gone half the
+	// distance to the intercept point, and pick the same hemisphere. If 
+	// we're chasing a relatively close UFO, it will tell us to keep chasing;
+	// if we're going after a near-antipodal UFO that will soon be traveling 
+	// towards us, it'll tell us to meet it on the other side.
+	// That means to go to the Far point but along the hemisphere where the
+	// UFO is in half that time. This is an approximation to minimizing the
+	// average distance between the UFO and the interceptor along the 
+	// intercept path, which makes sense since the UFO might change its
+	// trajectory at some later point and we then want to be close to it.
+
+	double aX, aY, aZ;
+	//long double bX, bY, bZ;
+
+	getGreatCirclePoint(tFar.first/4.0, uX, uY, uZ, wX, wY, wZ, 
+		aX, aY, aZ);
+	_meetPointLon = atan2(aY, aX);
+	_meetPointLat = asin(aZ);
+	double halfwaydLon, halfwaydLat;
+	calcdLonLat(halfwaydLon, halfwaydLat);
+
+	getGreatCirclePoint(tFar.first, uX, uY, uZ, wX, wY, wZ, 
+		trX, trY, trZ);
+	_meetPointLon =  atan2(trY, trX); 
+	_meetPointLat = asin(trZ);
+	double dLon, dLat;
+	calcdLonLat(dLon, dLat);
+
+	/*double cX, cY, cZ;
+	//cross(ourX, ourY, ourZ, destX, destY, destZ, cX, cY, cZ); // <-- STABLE!
+	cross(ourX, ourY, ourZ, trX, trY, trZ, cX, cY, cZ); // <-- unstable
+	//cross(trX, trY, trZ, ourX, ourY, ourZ, cX, cY, cZ);
+	bX = cX;
+	bY = cY;
+	bZ = cZ;
+	//cross(cX, cY, cZ, ourX, ourY, ourZ, bX, bY, bZ);
+	r = sqrtl(bX*bX+bY*bY+bZ*bZ);
+	bX /= r;
+	bY /= r;
+	bZ /= r;
+
+	//double cX, cY, cZ;
+	long double lenOffPlane = aX * bX + aY * bY + aZ * bZ;
+	aX -= lenOffPlane * bX;
+	aY -= lenOffPlane * bY;
+	aZ -= lenOffPlane * bZ;
+	
+	_meetPointLon = atan2(aY, aX);
+	_meetPointLat = asin(aZ);*/
+	//_lon = atan2(aY, aX);
+	//_lat = asin(aZ);
+
+	
+	// If the delta lat/lon according to the halfway is opposite the
+	// delta lat/long according to the final intercept point, we should 
+	// adjust the latter to go along the same hemisphere as the former.
+	if (halfwaydLon * dLon < 0 || halfwaydLat * dLat < 0)
+	{
+		// Shorten our destination point to be halfway along the great circle
+		// given by our position and the destination point.
+		trX = (trX + uX) / 2.0;
+		trY = (trY + uY) / 2.0;
+		trZ = (trZ + uZ) / 2.0;
+		_meetPointLon = atan2(trY, trX); 
+		_meetPointLat = asin(trZ);
+	}
 }
 
 /**
